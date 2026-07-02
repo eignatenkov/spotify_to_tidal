@@ -201,7 +201,12 @@ async def get_tracks_from_spotify_playlist(spotify_session: spotipy.Spotify, spo
         return spotify_session.playlist_tracks(playlist_id=playlist_id, fields=fields, offset=offset)
 
     print(f"Loading tracks from Spotify playlist '{spotify_playlist['name']}'")
-    items = await repeat_on_request_error( _fetch_all_from_spotify_in_chunks, lambda offset: _get_tracks_from_spotify_playlist(offset=offset, playlist_id=spotify_playlist["id"]))
+    if '_scraper_tracks' in spotify_playlist:
+        # Playlist was fetched via spotify-scraper; tracks are already converted
+        # and fully loaded, so no additional paging against the API is needed.
+        items = spotify_playlist['_scraper_tracks']
+    else:
+        items = await repeat_on_request_error( _fetch_all_from_spotify_in_chunks, lambda offset: _get_tracks_from_spotify_playlist(offset=offset, playlist_id=spotify_playlist["id"]))
     track_filter = lambda item: item.get('type', 'track') == 'track' # type may be 'episode' also
     sanity_filter = lambda item: 'album' in item and 'name' in item['album'] and 'artists' in item['album'] and len(item['album']['artists']) > 0
     return list(filter(sanity_filter, filter(track_filter, items)))

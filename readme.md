@@ -50,6 +50,29 @@ spotify_to_tidal --sync-artists
 
 See example_config.yml for more configuration options, and `spotify_to_tidal --help` for more options.
 
+Reading playlists without a Spotify API subscription (spotify-scraper mode)
+--------------------------------------------------------------------------
+This branch reads the source Spotify playlist via the [`spotifyscraper`](https://pypi.org/project/spotifyscraper/)
+library instead of the official Spotify Web API. This avoids the
+`403 – Active premium subscription required for the owner of the app` error that
+the Web API returns when the account behind the Spotify app is no longer
+premium. No Spotify client id/secret is needed for this path.
+
+The Tidal side (matching, searching, creating/updating the playlist) is
+unchanged, so the usual command still works and updates an existing Tidal
+playlist of the same name when tracks change:
+
+```bash
+spotify_to_tidal --uri 2xAZhFiPSUhb5Mi4ir9Lht   # id, spotify:playlist:<id>, or open.spotify.com url
+```
+
+Limitations of scraper mode: only reading *public* playlists is supported
+(`--uri`, or `sync_playlists` mappings in the config). ISRC and album-artist
+metadata are not exposed by the scraper, so track matching relies on the
+duration + name + artist heuristic rather than exact ISRC matches. Syncing
+favorites / followed artists / saved albums / your own account's playlist list
+requires the authenticated Web API and is not available in this mode.
+
 ---
 
 #### Join our amazing community as a code contributor

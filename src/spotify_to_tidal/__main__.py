@@ -4,6 +4,7 @@ import sys
 
 from . import sync as _sync
 from . import auth as _auth
+from . import spotify_scraper_adapter as _scraper
 
 def main():
     parser = argparse.ArgumentParser()
@@ -20,8 +21,8 @@ def main():
 
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
-    print("Opening Spotify session")
-    spotify_session = _auth.open_spotify_session(config['spotify'])
+    print("Opening Spotify session (spotify-scraper, no API key required)")
+    spotify_session = _scraper.open_spotify_scraper_session()
     print("Opening Tidal session")
     tidal_session = _auth.open_tidal_session()
     if not tidal_session.check_login():
