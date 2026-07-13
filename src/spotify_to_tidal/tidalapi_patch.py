@@ -1,15 +1,34 @@
 import asyncio
 import math
+import time
 from typing import List
+import requests
 import tidalapi
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
-def _remove_indices_from_playlist(playlist: tidalapi.UserPlaylist, indices: List[int]):
-    headers = {'If-None-Match': playlist._etag}
+def _remove_indices_from_playlist(playlist: tidalapi.UserPlaylist, indices: List[int], max_retries: int=5):
+    # Tidal uses the playlist ETag as an optimistic-concurrency token: every edit must send the
+    # current ETag via If-None-Match, and the ETag changes on each edit. tidalapi refreshes it with
+    # a follow-up GET (_reparse), but Tidal's read replicas lag behind the write we just made, so
+    # that GET can hand back a stale ETag and the next DELETE fails the precondition with a 412.
+    # A 412 means the write was NOT applied, so back off (letting the replicas converge), re-fetch
+    # the ETag, and retry the same batch. _reparse() also refreshes num_tracks, which the caller's
+    # loop relies on to terminate.
     index_string = ",".join(map(str, indices))
-    playlist.request.request('DELETE', (playlist._base_url + '/items/%s') % (playlist.id, index_string), headers=headers)
-    playlist._reparse()
+    url = (playlist._base_url + '/items/%s') % (playlist.id, index_string)
+    for attempt in range(max_retries):
+        headers = {'If-None-Match': playlist._etag}
+        try:
+            playlist.request.request('DELETE', url, headers=headers)
+            playlist._reparse()
+            return
+        except requests.exceptions.HTTPError as e:
+            if getattr(e.response, 'status_code', None) == 412 and attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+                playlist._reparse()  # re-fetch the (hopefully now-current) ETag and retry the batch
+                continue
+            raise
 
 def clear_tidal_playlist(playlist: tidalapi.UserPlaylist, chunk_size: int=20):
     with tqdm(desc="Erasing existing tracks from Tidal playlist", total=playlist.num_tracks) as progress:
@@ -18,12 +37,27 @@ def clear_tidal_playlist(playlist: tidalapi.UserPlaylist, chunk_size: int=20):
             _remove_indices_from_playlist(playlist, indices)
             progress.update(len(indices))
     
+def _add_chunk_to_playlist(playlist: tidalapi.UserPlaylist, track_ids: List[int], max_retries: int=5):
+    # Same stale-ETag / 412 concurrency race as _remove_indices_from_playlist, but on the add path.
+    # playlist.add() sends If-None-Match and re-parses on success; a 412 means the add was rejected
+    # (not applied), so back off, refresh the ETag, and retry the same chunk.
+    for attempt in range(max_retries):
+        try:
+            playlist.add(track_ids)
+            return
+        except requests.exceptions.HTTPError as e:
+            if getattr(e.response, 'status_code', None) == 412 and attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+                playlist._reparse()
+                continue
+            raise
+
 def add_multiple_tracks_to_playlist(playlist: tidalapi.UserPlaylist, track_ids: List[int], chunk_size: int=20):
     offset = 0
     with tqdm(desc="Adding new tracks to Tidal playlist", total=len(track_ids)) as progress:
         while offset < len(track_ids):
             count = min(chunk_size, len(track_ids) - offset)
-            playlist.add(track_ids[offset:offset+chunk_size])
+            _add_chunk_to_playlist(playlist, track_ids[offset:offset+chunk_size])
             offset += count
             progress.update(count)
 
