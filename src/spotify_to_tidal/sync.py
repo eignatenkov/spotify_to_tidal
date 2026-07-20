@@ -13,7 +13,7 @@ import sys
 import spotipy
 import tidalapi
 from tidalapi.exceptions import InvalidISRC, ObjectNotFound
-from .tidalapi_patch import add_multiple_tracks_to_playlist, clear_tidal_playlist, get_all_favorites, get_all_playlists, get_all_playlist_tracks
+from .tidalapi_patch import add_multiple_tracks_to_playlist, clear_tidal_playlist, remove_indices_from_playlist, get_all_favorites, get_all_playlists, get_all_playlist_tracks
 import time
 from tqdm.asyncio import tqdm as atqdm
 from tqdm import tqdm
@@ -315,6 +315,36 @@ def album_match(tidal_album, spotify_album, threshold=0.6):
     track_count_match = tidal_album.num_tracks == spotify_album.get("total_tracks", -1)
     return name_match and artist_match and track_count_match
 
+def reconcile_tidal_playlist(tidal_playlist: tidalapi.UserPlaylist, old_tidal_track_ids: Sequence[int], new_tidal_track_ids: Sequence[int]):
+    """ Bring the Tidal playlist in line with the desired track list by removing only the tracks
+        that are no longer wanted and appending only the genuinely new ones, WITHOUT clearing and
+        rebuilding the whole playlist. This is order-insensitive: tracks that stay keep their
+        existing position (and their Tidal date-added), and new tracks are appended at the end, so
+        the order won't necessarily match Spotify exactly. That trade-off is deliberate — it avoids
+        wiping the playlist (and resetting date-added/order) on every mid-list insert, removal or
+        reorder. """
+    new_id_set = set(new_tidal_track_ids)
+    old_id_set = set(old_tidal_track_ids)
+
+    # Indices (in the current playlist) to delete: any track not in the desired set, plus duplicate
+    # occurrences of a wanted track beyond its first appearance.
+    indices_to_remove = []
+    kept = set()
+    for idx, tid in enumerate(old_tidal_track_ids):
+        if tid in new_id_set and tid not in kept:
+            kept.add(tid)
+        else:
+            indices_to_remove.append(idx)
+
+    # Desired tracks not already present (new_tidal_track_ids is already de-duplicated upstream).
+    ids_to_add = [tid for tid in new_tidal_track_ids if tid not in old_id_set]
+
+    print(f"Reconciling Tidal playlist in place: removing {len(indices_to_remove)}, adding {len(ids_to_add)} (keeping {len(kept)})")
+    if indices_to_remove:
+        remove_indices_from_playlist(tidal_playlist, indices_to_remove)
+    if ids_to_add:
+        add_multiple_tracks_to_playlist(tidal_playlist, ids_to_add)
+
 async def sync_playlist(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, spotify_playlist, tidal_playlist: tidalapi.Playlist | None, config: dict):
     """ sync given playlist to tidal """
     # Get the tracks from both Spotify and Tidal, creating a new Tidal playlist if necessary
@@ -338,12 +368,14 @@ async def sync_playlist(spotify_session: spotipy.Spotify, tidal_session: tidalap
     if new_tidal_track_ids == old_tidal_track_ids:
         print("No changes to write to Tidal playlist")
     elif new_tidal_track_ids[:len(old_tidal_track_ids)] == old_tidal_track_ids:
-        # Append new tracks to the existing playlist if possible
+        # Fast path: the change is a pure end-append and the existing order already matches, so
+        # just append the new tail (preserves order exactly).
         add_multiple_tracks_to_playlist(tidal_playlist, new_tidal_track_ids[len(old_tidal_track_ids):])
     else:
-        # Erase old playlist and add new tracks from scratch if any reordering occured
-        clear_tidal_playlist(tidal_playlist)
-        add_multiple_tracks_to_playlist(tidal_playlist, new_tidal_track_ids)
+        # Any other change (mid-list insert/removal/reorder, or a track that dropped out): reconcile
+        # in place by removing only what's gone and adding only what's new, instead of wiping and
+        # rebuilding the whole playlist.
+        reconcile_tidal_playlist(tidal_playlist, old_tidal_track_ids, new_tidal_track_ids)
 
 async def sync_favorites(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config: dict):
     """ sync user favorites to tidal """

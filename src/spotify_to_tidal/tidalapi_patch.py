@@ -37,6 +37,18 @@ def clear_tidal_playlist(playlist: tidalapi.UserPlaylist, chunk_size: int=20):
             _remove_indices_from_playlist(playlist, indices)
             progress.update(len(indices))
     
+def remove_indices_from_playlist(playlist: tidalapi.UserPlaylist, indices: List[int], chunk_size: int=20):
+    # Remove a specific set of item indices from the playlist (used by the in-place reconcile,
+    # as opposed to clear_tidal_playlist which wipes everything). Deletes are done in DESCENDING
+    # index order and in chunks: removing a higher index never shifts a lower one, so the indices
+    # we still hold stay valid across chunks even though _reparse() reindexes after each batch.
+    indices = sorted(set(indices), reverse=True)
+    with tqdm(desc="Removing tracks from Tidal playlist", total=len(indices)) as progress:
+        for offset in range(0, len(indices), chunk_size):
+            chunk = indices[offset:offset + chunk_size]
+            _remove_indices_from_playlist(playlist, chunk)
+            progress.update(len(chunk))
+
 def _add_chunk_to_playlist(playlist: tidalapi.UserPlaylist, track_ids: List[int], max_retries: int=5):
     # Same stale-ETag / 412 concurrency race as _remove_indices_from_playlist, but on the add path.
     # playlist.add() sends If-None-Match and re-parses on success; a 412 means the add was rejected
