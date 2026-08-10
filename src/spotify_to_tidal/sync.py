@@ -30,6 +30,41 @@ def simple(input_string: str) -> str:
     # only take the first part of a string before any hyphens or brackets to account for different versions
     return input_string.split('-')[0].strip().split('(')[0].strip().split('[')[0].strip()
 
+# Apostrophe variants (straight, curly, modifier-letter, acute, grave) are dropped
+# entirely so that "Paul's", "Paul’s" and "Paul´s" all collapse to "pauls".
+_APOSTROPHES = dict.fromkeys(map(ord, "'’‘ʼ´`"), None)
+# Splits a credit string into individual artists. Only commas, ampersands and an
+# explicit "feat."/"featuring" marker are treated as separators — deliberately NOT
+# " and "/" with "/"/" ", which appear inside real single-act names ("Iron and Wine",
+# "Belle and Sebastian", "AC/DC"). "feat" is word-boundary-anchored so it doesn't fire
+# inside words like "Defeated".
+_ARTIST_SPLIT = re.compile(r'[,&]|\bfeaturing\b|\bfeat\b\.?', re.IGNORECASE)
+# A trailing ensemble-size qualifier that Spotify and Tidal disagree on ("Lewis" vs
+# "Lewis Quartet"). Anchored to the end of the cleaned string so it only strips a
+# genuine trailing qualifier, never an occurrence mid-name.
+_BAND_SUFFIX = re.compile(r'\s+(?:quartet|quintet|trio|duo|sextet|septet|octet|band|ensemble|orchestra|group|project|collective)$')
+
+def clean(s: str) -> str:
+    """Aggressively normalize a string for fuzzy comparison: fold ligatures and
+    accented characters via NFKD (so "ﬀ" -> "ff", "ü" -> "u"), drop apostrophes and
+    combining marks, lower-case, and collapse every run of non-alphanumeric
+    characters to a single space. Unlike ``normalize`` (NFD), this folds
+    compatibility characters, which is what makes ligatures/curly-quotes comparable."""
+    if not s:
+        return ""
+    s = s.translate(_APOSTROPHES)
+    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
+    return re.sub(r'[^a-z0-9]+', ' ', s.lower()).strip()
+
+def simple_name(s: str) -> str:
+    """The comparable core of a track title: drop a ' - ' version suffix, any
+    parenthetical/bracketed suffix, and a trailing 'feat.' credit, then clean().
+    Uses ' - ' (spaced) rather than a bare '-' so hyphenated words survive."""
+    s = s.split(' - ')[0]
+    s = re.split(r'[\(\[]', s)[0]
+    s = re.split(r'\bfeaturing\b|\bfeat\b\.?', s, flags=re.IGNORECASE)[0]
+    return clean(s)
+
 def validate_and_format_isrc(isrc: str) -> str | None:
     if not isrc or not isinstance(isrc, str):
         return None
@@ -54,55 +89,59 @@ def duration_match(tidal_track: tidalapi.Track, spotify_track, tolerance=2) -> b
     # the duration of the two tracks must be the same to within 2 seconds
     return abs(tidal_track.duration - spotify_track['duration_ms']/1000) < tolerance
 
+_NAME_EXCLUSIONS = ("instrumental", "acapella", "remix")
+
 def name_match(tidal_track, spotify_track) -> bool:
-    def exclusion_rule(pattern: str, tidal_track: tidalapi.Track, spotify_track: t_spotify.SpotifyTrack):
-        spotify_has_pattern = pattern in spotify_track['name'].lower()
-        tidal_has_pattern = pattern in tidal_track.name.lower() or (not tidal_track.version is None and (pattern in tidal_track.version.lower()))
-        return spotify_has_pattern != tidal_has_pattern
+    # A distinguishing keyword must be present on both sides or neither, so a track
+    # never matches its own instrumental/acapella/remix. Checked on the raw (lower)
+    # strings, including the Tidal version field, before any cleaning strips them.
+    spotify_name = spotify_track['name']
+    spotify_blob = spotify_name.lower()
+    tidal_blob = tidal_track.name.lower()
+    if tidal_track.version:
+        tidal_blob += " " + tidal_track.version.lower()
+    for pattern in _NAME_EXCLUSIONS:
+        if (pattern in spotify_blob) != (pattern in tidal_blob):
+            return False
 
-    # handle some edge cases
-    if exclusion_rule("instrumental", tidal_track, spotify_track): return False
-    if exclusion_rule("acapella", tidal_track, spotify_track): return False
-    if exclusion_rule("remix", tidal_track, spotify_track): return False
+    # Compare the cleaned core of the Spotify title against the cleaned full Tidal
+    # title. Accept a substring match either way (handles "Part II" vs "Adjust: Part
+    # II" and vice-versa), otherwise fall back to a high fuzzy ratio to tolerate
+    # source-metadata typos ("Sereande" vs "Serenade"). The surrounding match() still
+    # requires duration and artist agreement, which guards short-substring collisions.
+    spotify_core = simple_name(spotify_name)
+    tidal_full = clean(tidal_track.name)
+    if not spotify_core:
+        # The title was entirely a version/parenthetical suffix (e.g. "(Interlude)").
+        # Fall back to the uncleaned-of-suffixes full name rather than matching blindly.
+        spotify_core = clean(spotify_name)
+    if not spotify_core:
+        return True
+    if spotify_core in tidal_full or tidal_full in spotify_core:
+        return True
+    return SequenceMatcher(None, spotify_core, tidal_full).ratio() >= 0.86
 
-    # the simplified version of the Spotify track name must be a substring of the Tidal track name
-    # Try with both un-normalized and then normalized
-    simple_spotify_track = simple(spotify_track['name'].lower()).split('feat.')[0].strip()
-    return simple_spotify_track in tidal_track.name.lower() or normalize(simple_spotify_track) in normalize(tidal_track.name.lower())
+def _artist_name_set(names) -> Set[str]:
+    """Split each credit into individual artists, clean them, and drop a trailing
+    ensemble-size qualifier so "James Brandon Lewis Quartet" reduces to
+    "james brandon lewis" (matching a Spotify credit of just "James Brandon Lewis")."""
+    result: Set[str] = set()
+    for name in names:
+        for part in _ARTIST_SPLIT.split(name):
+            token = _BAND_SUFFIX.sub('', clean(part)).strip()
+            if token:
+                result.add(token)
+    return result
 
 def artist_match(tidal: tidalapi.Track | tidalapi.Album, spotify) -> bool:
-    def split_artist_name(artist: str) -> Sequence[str]:
-       if '&' in artist:
-           return artist.split('&')
-       elif ',' in artist:
-           return artist.split(',')
-       else:
-           return [artist]
-
-    def get_tidal_artists(tidal: tidalapi.Track | tidalapi.Album, do_normalize=False) -> Set[str]:
-        result: list[str] = []
-        for artist in tidal.artists:
-            if do_normalize:
-                artist_name = normalize(artist.name)
-            else:
-                artist_name = artist.name
-            result.extend(split_artist_name(artist_name))
-        return set([simple(x.strip().lower()) for x in result])
-
-    def get_spotify_artists(spotify, do_normalize=False) -> Set[str]:
-        result: list[str] = []
-        for artist in spotify['artists']:
-            if do_normalize:
-                artist_name = normalize(artist['name'])
-            else:
-                artist_name = artist['name']
-            result.extend(split_artist_name(artist_name))
-        return set([simple(x.strip().lower()) for x in result])
-    # There must be at least one overlapping artist between the Tidal and Spotify track
-    # Try with both un-normalized and then normalized
-    if get_tidal_artists(tidal).intersection(get_spotify_artists(spotify)) != set():
-        return True
-    return get_tidal_artists(tidal, True).intersection(get_spotify_artists(spotify, True)) != set()
+    # There must be at least one overlapping artist (after normalization and trailing
+    # ensemble-suffix stripping) between the Tidal and Spotify track. A stricter
+    # exact-set intersection is used deliberately: an earlier word-subset containment
+    # fallback let a single stray token (e.g. "the" left over from "The Trio") match
+    # unrelated artists, so it was removed.
+    tidal_artists = _artist_name_set(artist.name for artist in tidal.artists)
+    spotify_artists = _artist_name_set(artist['name'] for artist in spotify['artists'])
+    return bool(tidal_artists & spotify_artists)
 
 def match(tidal_track, spotify_track) -> bool:
     if not spotify_track['id']: return False
