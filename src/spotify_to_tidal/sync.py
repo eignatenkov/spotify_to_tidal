@@ -247,8 +247,19 @@ async def get_tracks_from_spotify_playlist(spotify_session: spotipy.Spotify, spo
     else:
         items = await repeat_on_request_error( _fetch_all_from_spotify_in_chunks, lambda offset: _get_tracks_from_spotify_playlist(offset=offset, playlist_id=spotify_playlist["id"]))
     track_filter = lambda item: item.get('type', 'track') == 'track' # type may be 'episode' also
-    sanity_filter = lambda item: 'album' in item and 'name' in item['album'] and 'artists' in item['album'] and len(item['album']['artists']) > 0
-    return list(filter(sanity_filter, filter(track_filter, items)))
+    # A track only needs its own name and at least one artist to be matchable; the album
+    # (and album artists) are optional, since album-based search self-guards on them.
+    # Previously this gated on album['artists'], which silently dropped EVERY track when
+    # spotify-scraper degraded to embed ("tier-2") data (album is None there) — turning a
+    # degraded fetch into an invisible no-op. See spotify_scraper_adapter._convert_track.
+    sanity_filter = lambda item: bool(item.get('name')) and bool(item.get('artists'))
+    tracks = list(filter(track_filter, items))
+    usable = list(filter(sanity_filter, tracks))
+    dropped = len(tracks) - len(usable)
+    if dropped:
+        print(f"Warning: skipped {dropped}/{len(tracks)} track(s) in '{spotify_playlist['name']}' "
+              f"missing name/artist metadata (possible degraded Spotify fetch)")
+    return usable
 
 def populate_track_match_cache(spotify_tracks_: Sequence[t_spotify.SpotifyTrack], tidal_tracks_: Sequence[tidalapi.Track]):
     """ Populate the track match cache with all the existing tracks in Tidal playlist corresponding to Spotify playlist """
@@ -389,7 +400,11 @@ async def sync_playlist(spotify_session: spotipy.Spotify, tidal_session: tidalap
     # Get the tracks from both Spotify and Tidal, creating a new Tidal playlist if necessary
     spotify_tracks = await get_tracks_from_spotify_playlist(spotify_session, spotify_playlist)
     if len(spotify_tracks) == 0:
-        return # nothing to do
+        # Make a degraded/empty fetch visible instead of looking like "already in sync":
+        # leaving the Tidal playlist untouched here is only correct if the source really is empty.
+        print(f"No usable tracks fetched for Spotify playlist '{spotify_playlist['name']}' — "
+              f"leaving Tidal playlist unchanged (source empty or fetch degraded)")
+        return
     if tidal_playlist:
         old_tidal_tracks = await get_all_playlist_tracks(tidal_playlist)
     else:
