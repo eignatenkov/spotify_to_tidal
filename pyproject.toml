@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spotify_to_tidal"
-version = "1.0.3"
+version = "1.0.7"
 requires-python = ">= 3.10"
 
 dependencies = [
-  "spotipy~=2.24.0",
+  "spotipy~=2.24",
   "spotifyscraper>=3.9,<4",
   "tidalapi==0.8.2",
   "pyyaml~=6.0",

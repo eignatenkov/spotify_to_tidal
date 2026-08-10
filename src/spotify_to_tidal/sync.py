@@ -249,9 +249,9 @@ async def get_tracks_from_spotify_playlist(spotify_session: spotipy.Spotify, spo
     track_filter = lambda item: item.get('type', 'track') == 'track' # type may be 'episode' also
     # A track only needs its own name and at least one artist to be matchable; the album
     # (and album artists) are optional, since album-based search self-guards on them.
-    # Previously this gated on album['artists'], which silently dropped EVERY track when
-    # spotify-scraper degraded to embed ("tier-2") data (album is None there) — turning a
-    # degraded fetch into an invisible no-op. See spotify_scraper_adapter._convert_track.
+    # This supersedes the upstream album-artist gate, which silently dropped EVERY track
+    # when spotify-scraper degraded to embed ("tier-2") data (album is None there) —
+    # turning a degraded fetch into an invisible no-op. See adapter._convert_track.
     sanity_filter = lambda item: bool(item.get('name')) and bool(item.get('artists'))
     tracks = list(filter(track_filter, items))
     usable = list(filter(sanity_filter, tracks))
@@ -351,7 +351,9 @@ async def search_new_tracks_on_tidal(tidal_session: tidalapi.Session, spotify_tr
             color = ('\033[91m', '\033[0m')
             print(color[0] + "Could not find the track " + song404[-1] + color[1])
     file_name = "songs not found.txt"
+    header = f"==========================\nPlaylist: {playlist_name}\n==========================\n"
     with open(file_name, "a", encoding="utf-8") as file:
+        file.write(header)
         for song in song404:
             file.write(f"{song}\n")
 
@@ -756,7 +758,7 @@ async def get_playlists_from_spotify(spotify_session: spotipy.Spotify, config):
             playlists.extend([p for p in extra_result['items']])
 
     # filter out playlists that don't belong to us or are on the exclude list
-    my_playlist_filter = lambda p: p['owner']['id'] == user_id
+    my_playlist_filter = lambda p: p and p['owner']['id'] == user_id
     exclude_filter = lambda p: not p['id'] in exclude_list
     return list(filter( exclude_filter, filter( my_playlist_filter, playlists )))
 
